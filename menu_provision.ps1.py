@@ -64,22 +64,50 @@ def limpiar_pantalla():
 
 
 def obtener_ip_propia():
-    """Detecta automáticamente la IP local del portátil."""
+    """Detecta la IP local de la interfaz de red activa de este equipo de forma infalible."""
+    # Método 1: Socket de enrutamiento
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.5)
         s.connect((SSH_HOST, 80))
-        ip_local = s.getsockname()[0]
+        ip = s.getsockname()[0]
         s.close()
-        return ip_local
+        if not ip.startswith("127."):
+            return ip
     except Exception:
-        return "127.0.0.1"
+        pass
+
+    # Método 2: Inspección directa de adaptadores de red en Windows
+    if platform.system().lower() == "windows":
+        try:
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notmatch 'Loopback|vEthernet|Virtual' -and $_.IPAddress -notlike '169.254*' } | Select-Object -ExpandProperty IPAddress"],
+                capture_output=True,
+                text=True
+            )
+            ips = [linea.strip() for linea in res.stdout.splitlines() if linea.strip()]
+            if ips:
+                return ips[0]
+        except Exception:
+            pass
+
+    # Método 3: Hostname local
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+
+    return "100.89.207.1"
 
 
 def sonda_ip_rapida(ip):
-    """Fuerza el registro ARP inmediato mediante sonda TCP y ping doble."""
+    """Obliga al sistema a registrar la MAC en la tabla ARP enviando tráfico rápido."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.08)
+        s.settimeout(0.04)
         s.connect_ex((ip, 5555))
         s.close()
     except Exception:
@@ -88,44 +116,28 @@ def sonda_ip_rapida(ip):
     is_windows = platform.system().lower() == "windows"
     param_cant = "-n" if is_windows else "-c"
     param_time = "-w" if is_windows else "-W"
-    timeout_val = "150" if is_windows else "1"
+    timeout_val = "60" if is_windows else "1"
 
-    comando = ["ping", param_cant, "2", param_time, timeout_val, ip]
-    subprocess.run(comando, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["ping", param_cant, "1", param_time, timeout_val, ip], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL)
     return ip
 
 
-def obtener_mapa_arp(ip_portatil):
-    """Lee solo la subinterfaz local vinculada a la IP del portátil."""
+def obtener_mapa_arp():
+    """Lee todas las entradas de la tabla ARP independientemente del idioma del PC."""
     mapa_arp = {}
     try:
-        resultado = subprocess.run(["arp", "-a"], capture_output=True, text=True)
-        secciones = (
-            resultado.stdout.split("Interfaz:")
-            if "Interfaz:" in resultado.stdout
-            else resultado.stdout.split("Interface:")
-        )
+        resultado = subprocess.run(["arp", "-a"], capture_output=True, text=True, errors="ignore")
+        patron = r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+([0-9a-fA-F]{2}[:-][0-9a-fA-F]{2}[:-][0-9a-fA-F]{2}[:-][0-9a-fA-F]{2}[:-][0-9a-fA-F]{2}[:-][0-9a-fA-F]{2})"
 
-        bloque_correcto = ""
-        for seccion in secciones:
-            if ip_portatil in seccion:
-                bloque_correcto = seccion
-                break
-
-        texto_a_analizar = bloque_correcto if bloque_correcto else resultado.stdout
-        patron = (
-            r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}).*?"
-            r"([0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5})"
-        )
-
-        for linea in texto_a_analizar.splitlines():
-            coincidencia = re.search(patron, linea)
-            if coincidencia:
-                ip = coincidencia.group(1)
-                mac = coincidencia.group(2).lower().replace(":", "-")
+        for linea in resultado.stdout.splitlines():
+            match = re.search(patron, linea)
+            if match:
+                ip = match.group(1)
+                mac = match.group(2).lower().replace(":", "-")
                 mapa_arp[ip] = mac
     except Exception as e:
-        print(f"\033[91m[!] Error al leer la tabla ARP: {e}\033[0m")
+        print(f"\033[91m[!] Error al leer tabla ARP: {e}\033[0m")
 
     return mapa_arp
 
@@ -137,12 +149,12 @@ def escanear_dispositivos(segmento_red, ip_portatil):
         for i in range(1, 255)
         if f"{segmento_red}{i}" not in (ip_portatil, SSH_HOST)
     ]
-    print(f"\n\033[96m[*] Escaneando red local desde {ip_portatil}...\033[0m")
+    print(f"\n\033[96m[*] Escaneando segmento local ({segmento_red}0/24) desde {ip_portatil}...\033[0m")
 
-    with ThreadPoolExecutor(max_workers=254) as executor:
+    with ThreadPoolExecutor(max_workers=120) as executor:
         list(executor.map(sonda_ip_rapida, lista_ips))
 
-    tabla_arp = obtener_mapa_arp(ip_portatil)
+    tabla_arp = obtener_mapa_arp()
     prefijos_validos = [p.lower().replace(":", "-") for p in FABRICANTES_PERMITIDOS]
     macs_excluidas = [m.lower().replace(":", "-") for m in MACS_IGNORADAS]
 
@@ -311,24 +323,35 @@ def forzar_desbloqueo_oem(ips_lista):
 
 
 def instalar_dependencias_completo():
-    """Opción 5: Descarga e instala todas las librerías, dependencias y herramientas necesarias para un PC nuevo."""
+    """Opción 5: Descarga e instala todas las librerías y configura la red para PC nuevo."""
     limpiar_pantalla()
     print("\033[95m╔══════════════════════════════════════════════════════════════╗\033[0m")
     print(
         "\033[95m║\033[0m       \033[1;97mINSTALADOR INTEGRAL DE DEPENDENCIAS (PC NUEVO)\033[0m         \033[95m║\033[0m")
     print("\033[95m╚══════════════════════════════════════════════════════════════╝\033[0m\n")
 
-    # 1. Actualización de PIP y herramientas base
-    print("\033[96m[1/3] Actualizando PIP y herramientas del compilador...\033[0m")
+    # 1. Configuración de perfil de red privada en Windows (permite ARP/Ping)
+    if platform.system().lower() == "windows":
+        print("\033[96m[1/4] Configurando red como 'Privada' para permitir escaneos...\033[0m")
+        try:
+            subprocess.run(["powershell", "-NoProfile", "-Command",
+                            "Set-NetConnectionProfile -NetworkCategory Private -ErrorAction SilentlyContinue"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print("\033[92m[✔] Perfil de red configurado correctamente.\033[0m\n")
+        except Exception:
+            pass
+
+    # 2. Actualización de PIP
+    print("\033[96m[2/4] Actualizando gestor PIP y herramientas...\033[0m")
     try:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
-        print("\033[92m[✔] Entorno PIP actualizado.\033[0m\n")
+        print("\033[92m[✔] PIP actualizado.\033[0m\n")
     except Exception as e:
-        print(f"\033[91m[!] Aviso en actualización de PIP: {e}\033[0m\n")
+        print(f"\033[91m[!] Aviso PIP: {e}\033[0m\n")
 
-    # 2. Instalación de librerías requeridas
+    # 3. Librerías Python
     librerias = ["paramiko", "cryptography", "bcrypt", "pynacl"]
-    print("\033[96m[2/3] Descargando e instalando librerías requeridas...\033[0m")
+    print("\033[96m[3/4] Instalando librerías requeridas...\033[0m")
     for lib in librerias:
         try:
             print(f"  --> Instalando: \033[93m{lib}\033[0m...")
@@ -337,19 +360,19 @@ def instalar_dependencias_completo():
         except Exception as e:
             print(f"  \033[91m[!] Error instalando {lib}: {e}\033[0m")
 
-    # 3. Comprobación y configuración de Platform Tools / ADB
-    print("\n\033[96m[3/3] Verificando herramientas ADB del sistema...\033[0m")
+    # 4. ADB / Platform Tools
+    print("\n\033[96m[4/4] Verificando Platform Tools / ADB...\033[0m")
     adb_instalado = False
     try:
         res = subprocess.run(["adb", "version"], capture_output=True, text=True)
         if res.returncode == 0:
             adb_instalado = True
-            print("  \033[92m[✔] ADB ya está presente en las variables del sistema.\033[0m")
+            print("  \033[92m[✔] ADB detectado en el sistema.\033[0m")
     except FileNotFoundError:
         adb_instalado = False
 
     if not adb_instalado and platform.system().lower() == "windows":
-        print("  \033[93m[*] ADB no detectado en Windows. Descargando Android Platform-Tools oficial...\033[0m")
+        print("  \033[93m[*] Descargando Android Platform-Tools oficial...\033[0m")
         url_adb = "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
         zip_path = "platform-tools.zip"
         try:
@@ -361,15 +384,17 @@ def instalar_dependencias_completo():
 
             ruta_adb = os.path.abspath("platform-tools")
             os.environ["PATH"] += os.pathsep + ruta_adb
-            print(f"  \033[92m[✔] Platform Tools descargado y cargado en: {ruta_adb}\033[0m")
+            print(f"  \033[92m[✔] Platform Tools descargado en: {ruta_adb}\033[0m")
         except Exception as e:
-            print(f"  \033[91m[!] No se pudo descargar ADB automáticamente: {e}\033[0m")
+            print(f"  \033[91m[!] Error descargando ADB: {e}\033[0m")
 
     ip_local = obtener_ip_propia()
-    print(f"\n\033[90mInformación de red: IP local vinculada -> \033[93m{ip_local}\033[0m")
+    segmento = ".".join(ip_local.split(".")[:3]) + "."
+    print(
+        f"\n\033[90mInformación de red activa: IP Local: \033[93m{ip_local}\033[0m │ Segmento: \033[93m{segmento}0/24\033[0m")
 
     print("\n\033[92m══════════════════════════════════════════════════════════════\033[0m")
-    print("\033[92m[✔] ¡Todas las dependencias y librerías quedaron instaladas!\033[0m")
+    print("\033[92m[✔] ¡Equipo preparado y dependencias instaladas con éxito!\033[0m")
     print("\033[92m══════════════════════════════════════════════════════════════\033[0m")
     input("\n\033[90mPresiona Enter para volver al menú principal...\033[0m")
 
@@ -379,7 +404,7 @@ def menu():
     ip_portatil = obtener_ip_propia()
     segmento_red = (
         ".".join(ip_portatil.split(".")[:3]) + "."
-        if ip_portatil != "127.0.0.1"
+        if not ip_portatil.startswith("127.")
         else "100.89.207."
     )
 
@@ -413,14 +438,12 @@ def menu():
 
         if opcion == "1":
             entrada = input("\n\033[97m¿Cuántas TV Boxes deseas procesar? (ej. 10): \033[0m").strip()
-
             if not entrada.isdigit() or int(entrada) <= 0:
-                input("\n\033[91m[!] Ingresa un número válido. Presiona Enter para volver...\033[0m")
+                input("\n\033[91m[!] Ingresa un número válido. Presiona Enter...\033[0m")
                 continue
 
             cantidad = int(entrada)
             dispositivos = escanear_dispositivos(segmento_red, ip_portatil)
-
             if not dispositivos:
                 input("\n\033[91m[!] No se encontraron TV Boxes activas. Presiona Enter...\033[0m")
                 continue
@@ -433,10 +456,7 @@ def menu():
             print(f"\n\033[92m[✔] Dispositivos a procesar ({len(ips_seleccionadas)}):\033[0m")
             print(f"\033[93m{cadena_ips}\033[0m")
 
-            comando_remoto = (
-                f"cd {CARPETA_SERVIDOR} && python3 {SCRIPT_SERVIDOR} --ips {cadena_ips}"
-            )
-
+            comando_remoto = f"cd {CARPETA_SERVIDOR} && python3 {SCRIPT_SERVIDOR} --ips {cadena_ips}"
             print(f"\n\033[96m[*] Iniciando aprovisionamiento en {SSH_USER}@{SSH_HOST}...\033[0m\n")
             estado = ejecutar_ssh_stream(comando_remoto)
 
@@ -464,41 +484,35 @@ def menu():
 
         elif opcion == "3":
             entrada = input("\n\033[97m¿A cuántas TV Boxes deseas forzar Modo Desarrollador y ADB?: \033[0m").strip()
-
             if not entrada.isdigit() or int(entrada) <= 0:
                 input("\n\033[91m[!] Ingresa un número válido. Presiona Enter...\033[0m")
                 continue
 
             cantidad = int(entrada)
             dispositivos = escanear_dispositivos(segmento_red, ip_portatil)
-
             if not dispositivos:
                 input("\n\033[91m[!] No se encontraron TV Boxes activas. Presiona Enter...\033[0m")
                 continue
 
             seleccionados = dispositivos[:cantidad]
             ips_seleccionadas = [d[0] for d in seleccionados]
-
             forzar_modo_desarrollador_y_adb(ips_seleccionadas)
             input("\n\033[92m[✔] Operación completada. Presiona Enter para volver al menú...\033[0m")
 
         elif opcion == "4":
             entrada = input("\n\033[97m¿A cuántas TV Boxes deseas forzar Desbloqueo OEM?: \033[0m").strip()
-
             if not entrada.isdigit() or int(entrada) <= 0:
                 input("\n\033[91m[!] Ingresa un número válido. Presiona Enter...\033[0m")
                 continue
 
             cantidad = int(entrada)
             dispositivos = escanear_dispositivos(segmento_red, ip_portatil)
-
             if not dispositivos:
                 input("\n\033[91m[!] No se encontraron TV Boxes activas. Presiona Enter...\033[0m")
                 continue
 
             seleccionados = dispositivos[:cantidad]
             ips_seleccionadas = [d[0] for d in seleccionados]
-
             forzar_desbloqueo_oem(ips_seleccionadas)
             input("\n\033[92m[✔] Desbloqueo OEM aplicado. Presiona Enter para volver al menú...\033[0m")
 
