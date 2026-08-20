@@ -63,48 +63,56 @@ def limpiar_pantalla():
         os.system("clear")
 
 
-def obtener_ip_propia():
-    """Detecta la IP local de la interfaz de red activa de este equipo de forma infalible."""
-    # Método 1: Socket de enrutamiento
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(0.5)
-        s.connect((SSH_HOST, 80))
-        ip = s.getsockname()[0]
-        s.close()
-        if not ip.startswith("127."):
-            return ip
-    except Exception:
-        pass
+def obtener_info_red_activa():
+    """
+    Detecta de forma automática la IP del portátil y la IP del MikroTik (Gateway)
+    sin importar qué segmento de red tenga configurado ese MikroTik.
+    """
+    ip_portatil = "127.0.0.1"
+    gateway = ""
 
-    # Método 2: Inspección directa de adaptadores de red en Windows
+    # Método 1: Detección por PowerShell en adaptadores físicos activos
     if platform.system().lower() == "windows":
         try:
-            res = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notmatch 'Loopback|vEthernet|Virtual' -and $_.IPAddress -notlike '169.254*' } | Select-Object -ExpandProperty IPAddress"],
-                capture_output=True,
-                text=True
+            ps_cmd = (
+                "Get-NetIPConfiguration | Where-Object { $_.IPv4DefaultGateway -ne $null -and $_.NetAdapter.Status -eq 'Up' } | "
+                "Select-Object -First 1 @{Name='IP';Expression={$_.IPv4Address.IPAddress}}, @{Name='GW';Expression={$_.IPv4DefaultGateway.NextHop}} | "
+                "ConvertTo-Csv -NoTypeInformation"
             )
-            ips = [linea.strip() for linea in res.stdout.splitlines() if linea.strip()]
-            if ips:
-                return ips[0]
+            res = subprocess.run(["powershell", "-NoProfile", "-Command", ps_cmd], capture_output=True, text=True)
+            lineas = [l.strip().replace('"', '') for l in res.stdout.splitlines() if
+                      l.strip() and not l.startswith("#")]
+            if len(lineas) >= 2:
+                datos = lineas[1].split(",")
+                if len(datos) == 2:
+                    ip_portatil = datos[0]
+                    gateway = datos[1]
+                    return ip_portatil, gateway
         except Exception:
             pass
 
-    # Método 3: Hostname local
-    try:
-        ip = socket.gethostbyname(socket.gethostname())
-        if not ip.startswith("127."):
-            return ip
-    except Exception:
-        pass
+    # Método 2: Socket UDP a broadcast de la red local
+    if ip_portatil.startswith("127."):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("224.0.0.1", 80))
+            ip_portatil = s.getsockname()[0]
+            s.close()
+        except Exception:
+            pass
 
-    return "100.89.207.1"
+    # Método 3: Fallback estándar
+    if ip_portatil.startswith("127."):
+        try:
+            ip_portatil = socket.gethostbyname(socket.gethostname())
+        except Exception:
+            ip_portatil = "192.168.88.10"
+
+    return ip_portatil, gateway
 
 
 def sonda_ip_rapida(ip):
-    """Obliga al sistema a registrar la MAC en la tabla ARP enviando tráfico rápido."""
+    """Obliga al MikroTik y a Windows a registrar la MAC de la TV Box en la tabla ARP."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(0.04)
@@ -124,7 +132,7 @@ def sonda_ip_rapida(ip):
 
 
 def obtener_mapa_arp():
-    """Lee todas las entradas de la tabla ARP independientemente del idioma del PC."""
+    """Lee todas las entradas de la tabla ARP independientemente del idioma del Windows."""
     mapa_arp = {}
     try:
         resultado = subprocess.run(["arp", "-a"], capture_output=True, text=True, errors="ignore")
@@ -142,14 +150,18 @@ def obtener_mapa_arp():
     return mapa_arp
 
 
-def escanear_dispositivos(segmento_red, ip_portatil):
-    """Escanea la red local y descarta equipos ajenos o excluidos."""
+def escanear_dispositivos(segmento_red, ip_portatil, gateway=""):
+    """Escanea el rango /24 completo del MikroTik al que estás conectado."""
+    exclusiones = {ip_portatil, SSH_HOST}
+    if gateway:
+        exclusiones.add(gateway)
+
     lista_ips = [
         f"{segmento_red}{i}"
         for i in range(1, 255)
-        if f"{segmento_red}{i}" not in (ip_portatil, SSH_HOST)
+        if f"{segmento_red}{i}" not in exclusiones
     ]
-    print(f"\n\033[96m[*] Escaneando segmento local ({segmento_red}0/24) desde {ip_portatil}...\033[0m")
+    print(f"\n\033[96m[*] Escaneando segmento del MikroTik actual ({segmento_red}0/24)...\033[0m")
 
     with ThreadPoolExecutor(max_workers=120) as executor:
         list(executor.map(sonda_ip_rapida, lista_ips))
@@ -160,15 +172,8 @@ def escanear_dispositivos(segmento_red, ip_portatil):
 
     dispositivos = []
     for ip, mac in tabla_arp.items():
-        if (
-                ip.startswith(segmento_red)
-                and ip not in (SSH_HOST, ip_portatil)
-                and ip not in IPS_IGNORADAS
-        ):
-            if (
-                    any(mac.startswith(p) for p in prefijos_validos)
-                    and mac not in macs_excluidas
-            ):
+        if ip.startswith(segmento_red) and ip not in exclusiones and ip not in IPS_IGNORADAS:
+            if any(mac.startswith(p) for p in prefijos_validos) and mac not in macs_excluidas:
                 mac_formateada = mac.upper().replace("-", ":")
                 dispositivos.append((ip, mac_formateada))
 
@@ -180,9 +185,7 @@ def guardar_y_abrir_macs(lista_macs, abrir_bloc_notas=False):
     with open(ARCHIVO_MACS, "w", encoding="utf-8") as f:
         f.write("\n".join(lista_macs) + "\n")
 
-    print(
-        f"\n\033[92m[✔] Se guardaron {len(lista_macs)} MACs en '{ARCHIVO_MACS}'\033[0m"
-    )
+    print(f"\n\033[92m[✔] Se guardaron {len(lista_macs)} MACs en '{ARCHIVO_MACS}'\033[0m")
 
     if abrir_bloc_notas and platform.system().lower() == "windows":
         subprocess.Popen(["notepad.exe", ARCHIVO_MACS])
@@ -208,7 +211,7 @@ def ejecutar_ssh_stream(comando):
 
         return canal.recv_exit_status()
     except Exception as e:
-        print(f"\n\033[91m[!] Error de conexión SSH: {e}\033[0m")
+        print(f"\n\033[91m[!] Error de conexión SSH con el servidor {SSH_HOST}: {e}\033[0m")
         return 1
     finally:
         ssh.close()
@@ -217,9 +220,7 @@ def ejecutar_ssh_stream(comando):
 def forzar_modo_desarrollador_y_adb(ips_lista):
     """Opción 3: Activa Modo Desarrollador y Depuración USB."""
     cadena_ips = " ".join(ips_lista)
-    print(
-        f"\n\033[93m[*] Activando Modo Desarrollador y Depuración USB en {len(ips_lista)} dispositivos...\033[0m"
-    )
+    print(f"\n\033[93m[*] Activando Modo Desarrollador y Depuración USB en {len(ips_lista)} dispositivos...\033[0m")
 
     comandos_adb = (
         "settings put global development_settings_enabled 1; "
@@ -261,11 +262,9 @@ def forzar_modo_desarrollador_y_adb(ips_lista):
 
 
 def forzar_desbloqueo_oem(ips_lista):
-    """Opción 4: Posicionamiento exacto y activación única de OEM sin rebotes."""
+    """Opción 4: Posicionamiento exacto y activación única de OEM."""
     cadena_ips = " ".join(ips_lista)
-    print(
-        f"\n\033[93m[*] Ejecutando activación limpia y única de Desbloqueo OEM en {len(ips_lista)} dispositivos...\033[0m"
-    )
+    print(f"\n\033[93m[*] Ejecutando activación de Desbloqueo OEM en {len(ips_lista)} dispositivos...\033[0m")
 
     script_control_remoto = (
         "settings put global development_settings_enabled 1; "
@@ -323,25 +322,23 @@ def forzar_desbloqueo_oem(ips_lista):
 
 
 def instalar_dependencias_completo():
-    """Opción 5: Descarga e instala todas las librerías y configura la red para PC nuevo."""
+    """Opción 5: Instala dependencias y configura Windows automáticamente."""
     limpiar_pantalla()
     print("\033[95m╔══════════════════════════════════════════════════════════════╗\033[0m")
     print(
         "\033[95m║\033[0m       \033[1;97mINSTALADOR INTEGRAL DE DEPENDENCIAS (PC NUEVO)\033[0m         \033[95m║\033[0m")
     print("\033[95m╚══════════════════════════════════════════════════════════════╝\033[0m\n")
 
-    # 1. Configuración de perfil de red privada en Windows (permite ARP/Ping)
     if platform.system().lower() == "windows":
-        print("\033[96m[1/4] Configurando red como 'Privada' para permitir escaneos...\033[0m")
+        print("\033[96m[1/4] Configurando perfil de red privada para permitir escaneo...\033[0m")
         try:
             subprocess.run(["powershell", "-NoProfile", "-Command",
                             "Set-NetConnectionProfile -NetworkCategory Private -ErrorAction SilentlyContinue"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            print("\033[92m[✔] Perfil de red configurado correctamente.\033[0m\n")
+            print("\033[92m[✔] Red configurada como Privada.\033[0m\n")
         except Exception:
             pass
 
-    # 2. Actualización de PIP
     print("\033[96m[2/4] Actualizando gestor PIP y herramientas...\033[0m")
     try:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
@@ -349,7 +346,6 @@ def instalar_dependencias_completo():
     except Exception as e:
         print(f"\033[91m[!] Aviso PIP: {e}\033[0m\n")
 
-    # 3. Librerías Python
     librerias = ["paramiko", "cryptography", "bcrypt", "pynacl"]
     print("\033[96m[3/4] Instalando librerías requeridas...\033[0m")
     for lib in librerias:
@@ -360,7 +356,6 @@ def instalar_dependencias_completo():
         except Exception as e:
             print(f"  \033[91m[!] Error instalando {lib}: {e}\033[0m")
 
-    # 4. ADB / Platform Tools
     print("\n\033[96m[4/4] Verificando Platform Tools / ADB...\033[0m")
     adb_instalado = False
     try:
@@ -384,14 +379,14 @@ def instalar_dependencias_completo():
 
             ruta_adb = os.path.abspath("platform-tools")
             os.environ["PATH"] += os.pathsep + ruta_adb
-            print(f"  \033[92m[✔] Platform Tools descargado en: {ruta_adb}\033[0m")
+            print(f"  \033[92m[✔] ADB descargado en: {ruta_adb}\033[0m")
         except Exception as e:
             print(f"  \033[91m[!] Error descargando ADB: {e}\033[0m")
 
-    ip_local = obtener_ip_propia()
+    ip_local, gw = obtener_info_red_activa()
     segmento = ".".join(ip_local.split(".")[:3]) + "."
     print(
-        f"\n\033[90mInformación de red activa: IP Local: \033[93m{ip_local}\033[0m │ Segmento: \033[93m{segmento}0/24\033[0m")
+        f"\n\033[90mRed detectada: IP Portatil: \033[93m{ip_local}\033[0m │ MikroTik/Gateway: \033[93m{gw or 'N/D'}\033[0m │ Subred: \033[93m{segmento}0/24\033[0m")
 
     print("\n\033[92m══════════════════════════════════════════════════════════════\033[0m")
     print("\033[92m[✔] ¡Equipo preparado y dependencias instaladas con éxito!\033[0m")
@@ -401,12 +396,8 @@ def instalar_dependencias_completo():
 
 def menu():
     configurar_consola()
-    ip_portatil = obtener_ip_propia()
-    segmento_red = (
-        ".".join(ip_portatil.split(".")[:3]) + "."
-        if not ip_portatil.startswith("127.")
-        else "100.89.207."
-    )
+    ip_portatil, gateway = obtener_info_red_activa()
+    segmento_red = ".".join(ip_portatil.split(".")[:3]) + "."
 
     while True:
         limpiar_pantalla()
@@ -414,7 +405,7 @@ def menu():
         print(
             "\033[96m║\033[0m        \033[1;97mGESTOR DE APROVISIONAMIENTO TV BOX (AUTO-SSH)\033[0m        \033[96m║\033[0m")
         print(
-            f"\033[96m║\033[0m   \033[90mIP Local:\033[0m \033[93m{ip_portatil:<15}\033[0m │ \033[90mSubred:\033[0m \033[93m{segmento_red}0/24\033[0m             \033[96m║\033[0m")
+            f"\033[96m║\033[0m   \033[90mIP Portátil:\033[0m \033[93m{ip_portatil:<14}\033[0m │ \033[90mSubred MikroTik:\033[0m \033[93m{segmento_red}0/24\033[0m       \033[96m║\033[0m")
         print("\033[96m╠══════════════════════════════════════════════════════════════╣\033[0m")
         print(
             "\033[96m║\033[0m  \033[1;92m[1]\033[0m Escanear y Aprovisionar (Abre MACs al finalizar)       \033[96m║\033[0m")
@@ -443,7 +434,7 @@ def menu():
                 continue
 
             cantidad = int(entrada)
-            dispositivos = escanear_dispositivos(segmento_red, ip_portatil)
+            dispositivos = escanear_dispositivos(segmento_red, ip_portatil, gateway)
             if not dispositivos:
                 input("\n\033[91m[!] No se encontraron TV Boxes activas. Presiona Enter...\033[0m")
                 continue
@@ -470,7 +461,7 @@ def menu():
             input("\n\033[90mPresiona Enter para volver al menú...\033[0m")
 
         elif opcion == "2":
-            dispositivos = escanear_dispositivos(segmento_red, ip_portatil)
+            dispositivos = escanear_dispositivos(segmento_red, ip_portatil, gateway)
             print(f"\n\033[92m[✔] Total detectadas ({len(dispositivos)}):\033[0m")
             if dispositivos:
                 ips = [d[0] for d in dispositivos]
@@ -479,7 +470,7 @@ def menu():
                 print(f"\033[93m{','.join(ips)}\033[0m")
                 guardar_y_abrir_macs(macs, abrir_bloc_notas=False)
             else:
-                print("\033[91mNo se encontraron dispositivos en la red.\033[0m")
+                print(f"\033[91mNo se encontraron TV Boxes en el segmento {segmento_red}0/24.\033[0m")
             input("\n\033[90mPresiona Enter para volver al menú...\033[0m")
 
         elif opcion == "3":
@@ -489,7 +480,7 @@ def menu():
                 continue
 
             cantidad = int(entrada)
-            dispositivos = escanear_dispositivos(segmento_red, ip_portatil)
+            dispositivos = escanear_dispositivos(segmento_red, ip_portatil, gateway)
             if not dispositivos:
                 input("\n\033[91m[!] No se encontraron TV Boxes activas. Presiona Enter...\033[0m")
                 continue
@@ -506,7 +497,7 @@ def menu():
                 continue
 
             cantidad = int(entrada)
-            dispositivos = escanear_dispositivos(segmento_red, ip_portatil)
+            dispositivos = escanear_dispositivos(segmento_red, ip_portatil, gateway)
             if not dispositivos:
                 input("\n\033[91m[!] No se encontraron TV Boxes activas. Presiona Enter...\033[0m")
                 continue
