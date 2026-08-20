@@ -59,16 +59,31 @@ FABRICANTES_PERMITIDOS = [
     "38-a4-ed",
 ]
 
+# Dispositivos que NUNCA son TV Box (MikroTik, tarjetas Intel/Realtek de PC)
+PREFIJOS_DESCARTAR = [
+    "48-8f-5a",  # MikroTik
+    "6c-3b-6b",  # MikroTik
+    "cc-2d-e0",  # MikroTik
+    "b8-69-f4",  # MikroTik
+    "dc-2c-6e",  # MikroTik
+    "18-fd-74",  # MikroTik
+    "00-e0-4c",  # Realtek LAN PC
+    "80-69-1a",  # Intel Wi-Fi / LAN
+    "94-e6-f7",  # Intel
+    "b4-96-91",  # Intel
+    "3c-e1-a1",  # HP
+    "d8-3a-dd",  # Dell
+    "ac-d1-b8",  # Lenovo
+]
+
 
 def configurar_consola():
-    """Habilita compatibilidad ANSI y título en PowerShell / CMD."""
     if platform.system().lower() == "windows":
         os.system("title GESTOR DE APROVISIONAMIENTO - SOMOS INTERNET")
         os.system("")
 
 
 def limpiar_pantalla():
-    """Limpia la terminal según el sistema operativo."""
     if platform.system().lower() == "windows":
         os.system("cls")
     else:
@@ -87,23 +102,19 @@ def obtener_ip_propia():
         return "127.0.0.1"
 
 
-def sonda_ip_rapida(ip):
-    """Fuerza el registro ARP inmediato mediante sonda TCP y ping doble."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.08)
-        s.connect_ex((ip, 5555))
-        s.close()
-    except Exception:
-        pass
-
-    is_windows = platform.system().lower() == "windows"
-    param_cant = "-n" if is_windows else "-c"
-    param_time = "-w" if is_windows else "-W"
-    timeout_val = "150" if is_windows else "1"
-
-    comando = ["ping", param_cant, "2", param_time, timeout_val, ip]
-    subprocess.run(comando, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def forzar_sonda_tvbox(ip):
+    """
+    Despierta forzosamente a la TV Box en la red enviando paquetes directos
+    a los puertos de ADB, HTTP y UPnP/mDNS.
+    """
+    for puerto in (5555, 6555, 80, 8080, 5353):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.015)
+            s.connect_ex((ip, puerto))
+            s.close()
+        except Exception:
+            pass
     return ip
 
 
@@ -143,55 +154,73 @@ def obtener_mapa_arp(ip_portatil):
 
 
 def escanear_dispositivos(segmento_red, ip_portatil):
-    """Escanea la red local y extrae únicamente las TV Boxes activas."""
+    """Escanea y fuerza el descubrimiento de todas las TV Boxes conectadas."""
     lista_ips = [
         f"{segmento_red}{i}"
         for i in range(1, 255)
         if f"{segmento_red}{i}" not in (ip_portatil, SSH_HOST)
     ]
-    print(f"\n\033[96m[*] Escaneando red local desde {ip_portatil}...\033[0m")
+    print(f"\n\033[96m[*] Forzando descubrimiento de TV Boxes en {segmento_red}0/24...\033[0m")
 
+    # Difusión UDP masiva para levantar equipos en stand-by
+    try:
+        sock_bcast = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock_bcast.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock_bcast.sendto(b"\x00", (f"{segmento_red}255", 5555))
+        sock_bcast.sendto(b"\x00", (f"{segmento_red}255", 6555))
+        sock_bcast.close()
+    except Exception:
+        pass
+
+    # Ráfaga ultrarrápida paralela (254 hilos)
     with ThreadPoolExecutor(max_workers=254) as executor:
-        list(executor.map(sonda_ip_rapida, lista_ips))
+        list(executor.map(forzar_sonda_tvbox, lista_ips))
 
     tabla_arp = obtener_mapa_arp(ip_portatil)
     prefijos_validos = [p.lower().replace(":", "-") for p in FABRICANTES_PERMITIDOS]
+    prefijos_descartar = [p.lower().replace(":", "-") for p in PREFIJOS_DESCARTAR]
     macs_excluidas = [m.lower().replace(":", "-") for m in MACS_IGNORADAS]
 
-    dispositivos = []
+    dispositivos_conocidos = []
+    dispositivos_candidatos = []
+
     for ip, mac in tabla_arp.items():
+        # Excluir broadcast, multicast y gateway .1/.254 si coincide
         if (
                 ip.startswith(segmento_red)
-                and ip not in (SSH_HOST, ip_portatil)
+                and ip not in (SSH_HOST, ip_portatil, f"{segmento_red}255", f"{segmento_red}1")
                 and ip not in IPS_IGNORADAS
+                and mac not in macs_excluidas
                 and not mac.startswith("ff-")
                 and not mac.startswith("01-00-5e")
         ):
-            if (
-                    any(mac.startswith(p) for p in prefijos_validos)
-                    and mac not in macs_excluidas
-            ):
-                mac_formateada = mac.upper().replace("-", ":")
-                dispositivos.append((ip, mac_formateada))
+            # Descartar PCs/Laptops y routers conocidos
+            if any(mac.startswith(p) for p in prefijos_descartar):
+                continue
 
-    return sorted(dispositivos, key=lambda item: int(item[0].split(".")[-1]))
+            mac_formateada = mac.upper().replace("-", ":")
+
+            if any(mac.startswith(p) for p in prefijos_validos):
+                dispositivos_conocidos.append((ip, mac_formateada))
+            else:
+                dispositivos_candidatos.append((ip, mac_formateada))
+
+    # Si hay coincidencias directas con TV Boxes las usa; si hay equipos nuevos conectados los incluye
+    resultado_final = dispositivos_conocidos if dispositivos_conocidos else dispositivos_candidatos
+    return sorted(resultado_final, key=lambda item: int(item[0].split(".")[-1]))
 
 
 def guardar_y_abrir_macs(lista_macs, abrir_bloc_notas=False):
-    """Guarda las MACs en el archivo txt y opcionalmente abre el Bloc de Notas."""
     with open(ARCHIVO_MACS, "w", encoding="utf-8") as f:
         f.write("\n".join(lista_macs) + "\n")
 
-    print(
-        f"\n\033[92m[✔] Se guardaron {len(lista_macs)} MACs en '{ARCHIVO_MACS}'\033[0m"
-    )
+    print(f"\n\033[92m[✔] Se guardaron {len(lista_macs)} MACs en '{ARCHIVO_MACS}'\033[0m")
 
     if abrir_bloc_notas and platform.system().lower() == "windows":
         subprocess.Popen(["notepad.exe", ARCHIVO_MACS])
 
 
 def ejecutar_ssh_stream(comando):
-    """Ejecuta un comando en el servidor vía Paramiko transmitiendo la salida en vivo."""
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
@@ -217,11 +246,8 @@ def ejecutar_ssh_stream(comando):
 
 
 def forzar_modo_desarrollador_y_adb(ips_lista):
-    """Opción 3: Activa Modo Desarrollador y Depuración USB."""
     cadena_ips = " ".join(ips_lista)
-    print(
-        f"\n\033[93m[*] Activando Modo Desarrollador y Depuración USB en {len(ips_lista)} dispositivos...\033[0m"
-    )
+    print(f"\n\033[93m[*] Activando Modo Desarrollador y Depuración USB en {len(ips_lista)} dispositivos...\033[0m")
 
     comandos_adb = (
         "settings put global development_settings_enabled 1; "
@@ -263,11 +289,9 @@ def forzar_modo_desarrollador_y_adb(ips_lista):
 
 
 def forzar_desbloqueo_oem(ips_lista):
-    """Opción 4: Posicionamiento exacto y activación única de OEM sin rebotes."""
     cadena_ips = " ".join(ips_lista)
     print(
-        f"\n\033[93m[*] Ejecutando activación limpia y única de Desbloqueo OEM en {len(ips_lista)} dispositivos...\033[0m"
-    )
+        f"\n\033[93m[*] Ejecutando activación limpia y única de Desbloqueo OEM en {len(ips_lista)} dispositivos...\033[0m")
 
     script_control_remoto = (
         "settings put global development_settings_enabled 1; "
@@ -325,7 +349,6 @@ def forzar_desbloqueo_oem(ips_lista):
 
 
 def instalar_dependencias_completo():
-    """Opción 5: Descarga e instala todas las librerías, dependencias y herramientas necesarias para un PC nuevo."""
     limpiar_pantalla()
     print("\033[95m╔══════════════════════════════════════════════════════════════╗\033[0m")
     print(
@@ -385,6 +408,37 @@ def instalar_dependencias_completo():
     input("\n\033[90mPresiona Enter para volver al menú principal...\033[0m")
 
 
+def actualizar_desde_git():
+    """Opción 6: Descarga e integra automáticamente las actualizaciones de GitHub."""
+    limpiar_pantalla()
+    print("\033[95m╔══════════════════════════════════════════════════════════════╗\033[0m")
+    print(
+        "\033[95m║\033[0m            \033[1;97mACTUALIZADOR DE SCRIPT DESDE GITHUB\033[0m               \033[95m║\033[0m")
+    print("\033[95m╚══════════════════════════════════════════════════════════════╝\033[0m\n")
+
+    print("\033[96m[*] Comprobando actualizaciones remotas en GitHub...\033[0m\n")
+    try:
+        resultado = subprocess.run(["git", "pull", "origin", "main"], capture_output=True, text=True)
+        print(resultado.stdout)
+        if resultado.stderr:
+            print(f"\033[90m{resultado.stderr}\033[0m")
+
+        if "Already up to date" in resultado.stdout or "Ya está actualizado" in resultado.stdout:
+            print("\033[92m[✔] El proyecto ya se encuentra en su versión más reciente.\033[0m")
+        else:
+            print("\033[92m[✔] ¡Actualización descargada con éxito!\033[0m")
+            print("\033[93m[*] Reiniciando el gestor...\033[0m")
+            time.sleep(2)
+            python_exe = sys.executable
+            os.execl(python_exe, python_exe, *sys.argv)
+    except FileNotFoundError:
+        print("\033[91m[!] Git no está instalado o no se encuentra en el PATH de este equipo.\033[0m")
+    except Exception as e:
+        print(f"\033[91m[!] Error durante la actualización: {e}\033[0m")
+
+    input("\n\033[90mPresiona Enter para volver al menú principal...\033[0m")
+
+
 def menu():
     configurar_consola()
     ip_portatil = obtener_ip_propia()
@@ -405,7 +459,7 @@ def menu():
         print(
             "\033[96m║\033[0m  \033[1;92m[1]\033[0m Escanear y Aprovisionar (Abre MACs al finalizar)       \033[96m║\033[0m")
         print(
-            "\033[96m║\033[0m  \033[1;92m[2]\033[0m Solo Escanear (Ver lista de IPs y guardar TXT)          \033[96m║\033[0m")
+            "\033[96m║\033[0m  \033[1;92m[2]\033[0m Solo Escanear (Ver TV Boxes detectadas y guardar TXT)    \033[96m║\033[0m")
         print(
             "\033[96m║\033[0m  \033[1;92m[3]\033[0m Forzar Modo Desarrollador y Depuración USB              \033[96m║\033[0m")
         print(
@@ -415,12 +469,14 @@ def menu():
             "\033[95m║\033[0m  \033[1;95m[ ⚙ CONFIGURACIÓN ]\033[0m                                         \033[95m║\033[0m")
         print(
             "\033[95m║\033[0m  \033[1;93m[5]\033[0m  Instalar Dependencias y Librerías (PC Nuevo)           \033[95m║\033[0m")
+        print(
+            "\033[95m║\033[0m  \033[1;93m[6]\033[0m  Actualizar Script desde GitHub (Git Pull)              \033[95m║\033[0m")
         print("\033[96m╠══════════════════════════════════════════════════════════════╣\033[0m")
         print(
             "\033[96m║\033[0m  \033[1;91m[0]\033[0m  Salir del Gestor                                       \033[96m║\033[0m")
         print("\033[96m╚══════════════════════════════════════════════════════════════╝\033[0m")
 
-        opcion = input("\n\033[1;97mSelecciona una opción [0-5]: \033[0m").strip()
+        opcion = input("\n\033[1;97mSelecciona una opción [0-6]: \033[0m").strip()
 
         if opcion == "1":
             entrada = input("\n\033[97m¿Cuántas TV Boxes deseas procesar? (ej. 10): \033[0m").strip()
@@ -441,7 +497,7 @@ def menu():
             macs_seleccionadas = [d[1] for d in seleccionados]
             cadena_ips = ",".join(ips_seleccionadas)
 
-            print(f"\n\033[92m[✔] Dispositivos a procesar ({len(ips_seleccionadas)}):\033[0m")
+            print(f"\n\033[92m[✔] TV Boxes a procesar ({len(ips_seleccionadas)}):\033[0m")
             print(f"\033[93m{cadena_ips}\033[0m")
 
             comando_remoto = (
@@ -466,13 +522,13 @@ def menu():
             if dispositivos:
                 ips = [d[0] for d in dispositivos]
                 macs = [d[1] for d in dispositivos]
-                print("\n\033[97mIPs encontradas:\033[0m")
+                print("\n\033[97mTV Boxes encontradas:\033[0m")
                 for d in dispositivos:
                     print(f"  \033[92m[TV BOX]\033[0m IP: \033[93m{d[0]:<15}\033[0m │ MAC: \033[96m{d[1]}\033[0m")
                 print(f"\n\033[97mCadena de IPs:\033[0m \033[93m{','.join(ips)}\033[0m")
                 guardar_y_abrir_macs(macs, abrir_bloc_notas=False)
             else:
-                print("\033[91mNo se encontraron TV Boxes en la red.\033[0m")
+                print("\033[91mNo se encontraron TV Boxes activas en la red.\033[0m")
 
             input("\n\033[90mPresiona Enter para volver al menú...\033[0m")
 
@@ -518,6 +574,9 @@ def menu():
 
         elif opcion == "5":
             instalar_dependencias_completo()
+
+        elif opcion == "6":
+            actualizar_desde_git()
 
         elif opcion == "0":
             limpiar_pantalla()
